@@ -25,7 +25,7 @@ import sys
 import time
 import math
 import PIL
-from PIL import Image, ImageFile
+from PIL import Image, ImageFile, ImageOps
 
 # Uncomment the below line to lift pixel limit for _trusted_ input files
 # Image.MAX_IMAGE_PIXELS = None
@@ -152,6 +152,266 @@ def lock_print(msg):
         print(msg)
 
 
+# ---------------------------------------------------------------------------
+# Processing pipeline stages
+#
+# read -> normalize orientation -> geometry -> resample -> write back
+#
+# Each stage is a separately testable unit. The order is significant:
+# EXIF orientation must be baked into the pixels (exactly once) before
+# the target geometry is computed, because orientations 5-8 swap width
+# and height; the ICC profile and remaining EXIF tags travel in the
+# ImageMeta object and are written back atomically at the end.
+# ---------------------------------------------------------------------------
+
+ORIENTATION_TAG = 0x0112  # EXIF orientation tag
+
+# compute_target_size() decisions
+SKIP = 'skip'              # do not write an output file
+LOWRES = 'lowres'          # do not write; count as a low-resolution no-op
+PASSTHROUGH = 'passthrough'  # write output without resampling
+RESIZE = 'resize'          # resample to the attached (hres, vres)
+
+
+class ImageMeta:
+    '''Metadata carried through the pipeline alongside the pixels'''
+
+    __slots__ = ('format', 'exif', 'icc_profile', 'progressive')
+
+    def __init__(self):
+        self.format = None
+        self.exif = b''
+        self.icc_profile = None
+        self.progressive = False
+
+
+def load_image(src):
+    '''Stage 1: read an image and its metadata
+
+    :return: (PIL.Image, ImageMeta) or None if the file is not processable
+    '''
+
+    try:
+        img = Image.open(src)
+        meta = ImageMeta()
+        meta.format = img.format
+
+        if meta.format not in ['JPEG', 'PNG', 'MPO', 'WEBP']:
+            if debug:
+                lock_print(src + ': not JPEG/PNG/MPO/WEBP. format: ' + str(meta.format))
+            return None
+
+        meta.progressive = progressive
+        try:
+            if meta.format == 'JPEG' and not meta.progressive and img.info['progressive']:
+                if debug:
+                    lock_print('load_image: progressive')
+                meta.progressive = True
+        except Exception:
+            pass
+
+        try:
+            if not eraseexif:
+                meta.exif = img.info['exif']
+        except Exception:
+            pass
+
+        # the ICC profile is colour (not EXIF) metadata: always keep it
+        meta.icc_profile = img.info.get('icc_profile')
+
+        ImageFile.MAXBLOCK = img.size[0] * img.size[1]
+        return img, meta
+    except OSError as e:
+        if not str(e).startswith('cannot identify image file'):
+            lock_print(e)
+        return None
+
+
+def normalize_orientation(img, meta):
+    '''Stage 2: bake the EXIF orientation into the pixels
+
+    The rotation/flip implied by the EXIF orientation tag is applied to
+    the pixel data exactly once, here, before any resampling, and the tag
+    is removed from the EXIF payload so viewers do not rotate the output
+    a second time. Must run before compute_target_size(): orientations
+    5-8 swap width and height.
+    '''
+
+    exif = img.getexif()
+    if exif.get(ORIENTATION_TAG, 1) == 1:
+        return img
+
+    img = ImageOps.exif_transpose(img)
+    if meta.exif and ORIENTATION_TAG in exif:
+        del exif[ORIENTATION_TAG]
+        meta.exif = exif.tobytes() if len(exif) else b''
+    return img
+
+
+def _round_half_up(x):
+    '''Round a float to the nearest int, halves rounded up'''
+
+    i = int(x)
+    return i + 1 if x >= i + .5 else i
+
+
+def compute_target_size(hres, vres, fmt):
+    '''Stage 3a: decide the output geometry (no pixel work)
+
+    :param hres: current (orientation-normalized) horizontal resolution
+    :param vres: current (orientation-normalized) vertical resolution
+    :param fmt: image format ('JPEG', 'PNG', 'MPO' or 'WEBP')
+    :return: (decision, value) where decision is one of SKIP, LOWRES,
+             PASSTHROUGH, RESIZE; value is the target (hres, vres) for
+             RESIZE, the failing dimension name for LOWRES, else None
+    '''
+
+    if hres < minH or vres < minV:
+        if debug:
+            lock_print('compute_target_size: hres < minH or vres < minV')
+        return (SKIP, None)
+
+    if keep and (HRES == hres or VRES == vres or scale == 100):
+        if progressive and fmt not in ['JPEG', 'MPO']:
+            return (SKIP, None)
+
+        if convert and fmt not in ['PNG', 'WEBP']:
+            return (SKIP, None)
+
+        return (PASSTHROUGH, None)
+
+    if megapixel:
+        img_mp = hres * vres / 1e6
+
+        shrink_factor = math.sqrt(megapixel / img_mp)
+        if shrink_factor >= 1 and not enlarge:
+            return (SKIP, None)
+
+        _hres = round(hres * shrink_factor)
+        _vres = round(vres * shrink_factor)
+
+        if debug:
+            lock_print(f"{img_mp} * {shrink_factor} → {_hres}x{_vres} ({_hres*_vres/1e6}MP)")
+
+        return (RESIZE, (_hres, _vres))
+
+    if scale:
+        if scale == 100:
+            return (RESIZE, (hres, vres))
+
+        return (RESIZE, (_round_half_up(hres * scale/float(100)),
+                         _round_half_up(vres * scale/float(100))))
+
+    if HRES == 0 or VRES == 0:
+        if HRES:
+            if not enlarge and HRES > hres:
+                return (LOWRES, 'hres')
+
+            return (RESIZE, (HRES, _round_half_up(vres * HRES/float(hres))))
+
+        # VRES is non-zero here (HRES and VRES cannot both be 0)
+        if not enlarge and VRES > vres:
+            return (LOWRES, 'vres')
+
+        return (RESIZE, (_round_half_up(hres * VRES/float(vres)), VRES))
+
+    if HRES == hres and VRES == vres:
+        if debug:
+            lock_print('compute_target_size: same res [%dx%d]' % (HRES, VRES))
+        return (PASSTHROUGH, None)
+
+    if force:
+        return (RESIZE, (HRES, VRES))
+
+    if adapt:
+        ratio_img = float(hres/vres)
+        ratio_target = float(HRES/VRES)
+
+        if (ratio_target >= 1 and ratio_img > 1) or (ratio_target < 1 and ratio_img >= 1):
+            # same orientation (H >= V and h > v) or
+            # cross orientation (H < V and h >= v)
+            if not enlarge and HRES > hres:
+                return (LOWRES, 'hres')
+
+            if HRES != hres:
+                return (RESIZE, (HRES, _round_half_up(vres * HRES/float(hres))))
+        elif (ratio_target < 1 and ratio_img < 1) or (ratio_target >= 1 and ratio_img <= 1):
+            # same orientation (H < V and h < v) or
+            # cross orientation (H >= V and h <= v)
+            if not enlarge and VRES > vres:
+                return (LOWRES, 'vres')
+
+            if VRES != vres:
+                return (RESIZE, (_round_half_up(hres * VRES/float(vres)), VRES))
+
+        return (PASSTHROUGH, None)
+
+    ratio_img = float(hres/vres)
+    ratio_target = float(HRES/VRES)
+
+    if ratio_img >= ratio_target:
+        if not enlarge and HRES > hres:
+            return (LOWRES, 'hres')
+
+        # re-sample as per target horizontal resolution
+        return (RESIZE, (HRES, _round_half_up(vres * HRES/float(hres))))
+
+    if not enlarge and VRES > vres:
+        return (LOWRES, 'vres')
+
+    # re-sample as per target vertical resolution
+    return (RESIZE, (_round_half_up(hres * VRES/float(vres)), VRES))
+
+
+def flatten_for_jpeg(img):
+    '''Stage 3b: strip the alpha channel for JPEG output'''
+
+    if img.mode in ('RGBA', 'LA'):
+        background = Image.new(img.mode.rstrip('A'), img.size, fill_color)
+        background.paste(img, img.split()[-1])
+        return background
+    if img.mode == 'P':
+        return img.convert('RGB')
+    return img
+
+
+def output_dest(name, ext, fmt):
+    '''Stage 4a: destination path and output format (applies --convert)
+
+    :return: (dest path, output format, converted?)
+    '''
+
+    suffix = '' if overwrite else pad
+    if convert and fmt in ['PNG', 'WEBP']:
+        return name + suffix + '.jpg', 'JPEG', True
+    return name + suffix + ext, fmt, False
+
+
+def save_image(img, dest, fmt, meta):
+    '''Stage 4b: write img to dest atomically, preserving metadata
+
+    The image is encoded to a temp file in the same directory and moved
+    over dest with os.replace(), so a failed encode never leaves a
+    partially written image behind.
+
+    :return: True on success, False on failure (dest left untouched)
+    '''
+
+    tmp = '%s.imgp%d.tmp' % (dest, os.getpid())
+    try:
+        img.save(tmp, fmt, quality=qual, optimize=optimal, exif=meta.exif,
+                 icc_profile=meta.icc_profile, progressive=meta.progressive)
+        os.replace(tmp, dest)
+        return True
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        lock_print(e)
+        return False
+
+
 # Settings workers read; spawn/forkserver workers don't inherit main()'s globals
 WORKER_VARS = ('HRES', 'VRES', 'megapixel', 'scale', 'rotate', 'adapt', 'convert',
                'hidden', 'eraseexif', 'force', 'includeimgp', 'keep', 'enlarge',
@@ -203,69 +463,35 @@ def traverse_dir(path):
 def rotate_image(src):
     '''Rotate a source image'''
 
-    converted = False
-    _progressive = progressive
     name, ext = os.path.splitext(src)
     if name.endswith(pad) and not includeimgp:
         return
 
-    try:
-        img = Image.open(src)
-        _format = img.format
-
-        if _format not in ['JPEG', 'PNG', 'MPO', 'WEBP']:
-            if debug:
-                lock_print(src + ': not JPEG/PNG/MPO/WEBP. format: ' + _format)
-            return
-
-        try:
-            if _format == 'JPEG' and not _progressive and img.info['progressive']:
-                if debug:
-                    lock_print('resize_image: progressive')
-                _progressive = True
-        except Exception:
-            pass
-
-        try:
-            if eraseexif:
-                exifdata = b''
-            else:
-                exifdata = img.info['exif']
-        except Exception:
-            exifdata = b''
-    except OSError as e:
-        if not str(e).startswith('cannot identify image file'):
-            lock_print(e)
+    loaded = load_image(src)
+    if loaded is None:
         return
+    img, meta = loaded
 
+    # normalize EXIF orientation before rotating so the rotation is
+    # applied on the pixels the user actually sees
     # Image.rotate(angle, resample=0, expand=0) expand = True means
     # the image will be enlarged to hold the entire rotated image
-    img = img.rotate(-rotate, 0, True)
+    try:
+        img = normalize_orientation(img, meta)
+        img = img.rotate(-rotate, 0, True)
+    except OSError as e:
+        img.close()
+        lock_print(e)
+        return
 
     if not mute:
         stats = src + '\n%ld bytes ->' % os.path.getsize(src)
 
-    if overwrite:
-        suffix = ''
-    else:
-        suffix = pad
+    dest, out_format, converted = output_dest(name, ext, meta.format)
+    if converted:
+        img = flatten_for_jpeg(img)
 
-    if convert and _format in ['PNG', 'WEBP']:
-        if img.mode in ('RGBA', 'LA'):
-            background = Image.new(img.mode.rstrip('A'), img.size, fill_color)
-            background.paste(img, img.split()[-1])
-            img = background
-        elif img.mode == "P":
-            img = img.convert("RGB")
-        dest = name + suffix + '.jpg'
-        _format = 'JPEG'
-        converted = True
-    else:
-        dest = name + suffix + ext
-
-    try:
-        img.save(dest, _format, quality=qual, optimize=optimal, exif=exifdata, progressive=_progressive)
-
+    if save_image(img, dest, out_format, meta):
         if not mute:
             lock_print('%s %ld bytes\n' % (stats, os.path.getsize(dest)))
 
@@ -273,258 +499,65 @@ def rotate_image(src):
             os.remove(src)
 
         return [1, 0]
-    except OSError as e:
-        lock_print(e)
 
 
 def resize_image(src):
     '''Resize a source image'''
 
-    converted = False
-    _progressive = progressive
     name, ext = os.path.splitext(src)
     if name.endswith(pad) and not includeimgp:
         return
 
+    loaded = load_image(src)
+    if loaded is None:
+        return
+    img, meta = loaded
+
+    # check if convert or progressive is specified without any resolution option
+    if no_res_opt:
+        if convert and meta.format not in ['PNG', 'WEBP']:
+            if debug:
+                lock_print('resize_image: cannot convert non-PNG/WEBP')
+            return
+
+        if progressive and meta.format not in ['JPEG', 'MPO']:
+            if debug:
+                lock_print('resize_image: cannot make non-JPEG/MPO progressive')
+            return
+
+    # bake EXIF orientation into the pixels before measuring/resampling
     try:
-        img = Image.open(src)
-        _format = img.format
+        img = normalize_orientation(img, meta)
+        hres, vres = img.size
 
-        if _format not in ['JPEG', 'PNG', 'MPO', 'WEBP']:
+        antialias = png_ip if meta.format == 'PNG' else Image.Resampling.LANCZOS
+
+        decision, value = compute_target_size(hres, vres, meta.format)
+        if decision == RESIZE:
+            img = gamma_aware_resize(img, value, antialias)
             if debug:
-                lock_print(src + ': not JPEG/PNG/MPO/WEBP. format: ' + _format)
-            return
-
-        # check if convert or progressive is specified without any resolution option
-        if no_res_opt:
-            if convert and _format not in ['PNG', 'WEBP']:
-                if debug:
-                    lock_print('resize_image: cannot convert non-PNG/WEBP')
-                return
-
-            if progressive and _format not in ['JPEG', 'MPO']:
-                if debug:
-                    lock_print('resize_image: cannot make non-JPEG/MPO progressive')
-                return
-
-        try:
-            if _format == 'JPEG' and not _progressive and img.info['progressive']:
-                if debug:
-                    lock_print('resize_image: progressive')
-                _progressive = True
-        except Exception:
-            pass
-
-        try:
-            if eraseexif:
-                exifdata = b''
-            else:
-                exifdata = img.info['exif']
-        except Exception:
-            exifdata = b''
+                lock_print('resize_image: scaled to [%dx%d]' % value)
     except OSError as e:
-        if not str(e).startswith('cannot identify image file'):
-            lock_print(e)
+        # e.g. truncated source: fail without touching the destination
+        img.close()
+        lock_print(e)
         return
 
-    hres, vres = img.size
-    ImageFile.MAXBLOCK = hres * vres
-
-    antialias = png_ip if _format == 'PNG' else Image.Resampling.LANCZOS
-
-    if hres < minH or vres < minV:
-        if debug:
-            lock_print('resize_image: hres < minH or vres < minV')
+    if decision == SKIP:
         return
-
-    if keep and (HRES == hres or VRES == vres or scale == 100):
-        if progressive and _format not in ['JPEG', 'MPO']:
-            return
-
-        if convert and _format not in ['PNG', 'WEBP']:
-            return
-
-    elif megapixel:
-        img_mp = hres * vres / 1e6
-
-        shrink_factor = math.sqrt(megapixel / img_mp)
-        if shrink_factor >= 1 and not enlarge:
-            return
-
-        _hres = round(hres * shrink_factor)
-        _vres = round(vres * shrink_factor)
-
-        if debug:
-            lock_print(f"{img_mp} * {shrink_factor} → {_hres}x{_vres} ({_hres*_vres/1e6}MP)")
-
-        img = gamma_aware_resize(img, (_hres, _vres), antialias)
-        if debug:
-            lock_print('resize_image: scaled to [%dx%d]' % (_hres, _vres))
-
-    elif scale:
-        if scale == 100:
-            _hres = hres
-            _vres = vres
-        else:
-            _hres = hres * scale/float(100)
-            # use custom round()
-            if _hres >= int(_hres) + .5:
-                _hres = _hres + 1
-            _hres = int(_hres)
-
-            _vres = vres * scale/float(100)
-            if _vres >= int(_vres) + .5:
-                _vres = _vres + 1
-            _vres = int(_vres)
-
-        img = gamma_aware_resize(img, (_hres, _vres), antialias)
-        if debug:
-            lock_print('resize_image: scaled to [%dx%d]' % (_hres, _vres))
-
-    elif HRES == 0 or VRES == 0:
-        if HRES:
-            if not enlarge and HRES > hres:
-                if not mute:
-                    lock_print('%s has lesser hres\n' % src)
-                return [0, 1]
-
-            hratio = HRES/float(hres)
-            target_vres = vres * hratio
-            if target_vres >= int(target_vres) + .5:
-                target_vres = target_vres + 1
-            target_vres = int(target_vres)
-
-            img = gamma_aware_resize(img, (HRES, target_vres), antialias)
-            if debug:
-                lock_print('resize_image: 0 vres %dx%d' % (HRES, target_vres))
-
-        if VRES:
-            if not enlarge and VRES > vres:
-                if not mute:
-                    lock_print('%s has lesser vres\n' % src)
-                return [0, 1]
-
-            vratio = VRES/float(vres)
-            target_hres = hres * vratio
-            if target_hres >= int(target_hres) + .5:
-                target_hres = target_hres + 1
-            target_hres = int(target_hres)
-
-            img = gamma_aware_resize(img, (target_hres, VRES), antialias)
-            if debug:
-                lock_print('resize_image: 0 hres %dx%d' % (target_hres, VRES))
-
-    elif HRES == hres and VRES == vres:
-        if debug:
-            lock_print('resize_image: same res [%dx%d]' % (HRES, VRES))
-
-    elif force:
-        img = gamma_aware_resize(img, (HRES, VRES), antialias)
-        if debug:
-            lock_print('resize_image: brute force res to [%dx%d]' % (HRES, VRES))
-
-    elif adapt:
-        ratio_img = float(hres/vres)
-        ratio_target = float(HRES/VRES)
-
-        if (ratio_target >= 1 and ratio_img > 1) or (ratio_target < 1 and ratio_img >= 1):
-            # same orientation (H >= V and h > v) or
-            # cross orientation (H < V and h >= v)
-            if not enlarge and HRES > hres:
-                if not mute:
-                    lock_print('%s has lesser hres\n' % src)
-                return [0, 1]
-
-            if HRES != hres:
-                hratio = HRES/float(hres)
-                target_vres = vres * hratio
-                if target_vres >= int(target_vres) + .5:
-                    target_vres = target_vres + 1
-                target_vres = int(target_vres)
-
-                img = gamma_aware_resize(img, (HRES, target_vres), antialias)
-                if debug:
-                    lock_print('resize_image: vres adapted %dx%d' % (HRES, target_vres))
-        elif (ratio_target < 1 and ratio_img < 1) or (ratio_target >= 1 and ratio_img <= 1):
-            # same orientation (H < V and h < v) or
-            # cross orientation (H >= V and h <= v)
-            if not enlarge and VRES > vres:
-                if not mute:
-                    lock_print('%s has lesser vres\n' % src)
-                return [0, 1]
-
-            if VRES != vres:
-                vratio = VRES/float(vres)
-                target_hres = hres * vratio
-                if target_hres >= int(target_hres) + .5:
-                    target_hres = target_hres + 1
-                target_hres = int(target_hres)
-
-                img = gamma_aware_resize(img, (target_hres, VRES), antialias)
-                if debug:
-                    lock_print('resize_image: hres adapted %dx%d' % (target_hres, VRES))
-
-    else:
-        ratio_img = float(hres/vres)
-        ratio_target = float(HRES/VRES)
-
-        if ratio_img >= ratio_target:
-            if not enlarge and HRES > hres:
-                if not mute:
-                    lock_print('%s has lesser hres\n' % src)
-                return [0, 1]
-
-            # re-sample as per target horizontal resolution
-            hratio = HRES/float(hres)
-            target_vres = vres * hratio
-            if target_vres >= int(target_vres) + .5:
-                target_vres = target_vres + 1
-            target_vres = int(target_vres)
-
-            img = gamma_aware_resize(img, (HRES, target_vres), antialias)
-            if debug:
-                lock_print('resize_image: vres calculated %dx%d' % (HRES, target_vres))
-        else:
-            if not enlarge and VRES > vres:
-                if not mute:
-                    lock_print('%s has lesser vres\n' % src)
-                return [0, 1]
-
-            # re-sample as per target vertical resolution
-            vratio = VRES/float(vres)
-            target_hres = hres * vratio
-            if target_hres >= int(target_hres) + .5:
-                target_hres = target_hres + 1
-            target_hres = int(target_hres)
-
-            img = gamma_aware_resize(img, (target_hres, VRES), antialias)
-            if debug:
-                lock_print('resize_image: hres calculated %dx%d' % (target_hres, VRES))
+    if decision == LOWRES:
+        if not mute:
+            lock_print('%s has lesser %s\n' % (src, value))
+        return [0, 1]
 
     if not mute:
         stats = src + '\n%dx%d -> %dx%d\n%ld bytes ->' % (hres, vres, img.size[0], img.size[1], os.path.getsize(src))
 
-    if overwrite:
-        suffix = ''
-    else:
-        suffix = pad
+    dest, out_format, converted = output_dest(name, ext, meta.format)
+    if converted:
+        img = flatten_for_jpeg(img)
 
-    if convert and _format in ['PNG', 'WEBP']:
-        if img.mode in ('RGBA', 'LA'):
-            background = Image.new(img.mode.rstrip('A'), img.size, fill_color)
-            background.paste(img, img.split()[-1])
-            img = background
-        elif img.mode == "P":
-            img = img.convert("RGB")
-        dest = name + suffix + '.jpg'
-        _format = 'JPEG'
-        converted = True
-    else:
-        dest = name + suffix + ext
-
-    try:
-        img.save(dest, _format, quality=qual, optimize=optimal, exif=exifdata, progressive=_progressive)
-
+    if save_image(img, dest, out_format, meta):
         if not mute:
             lock_print('%s %ld bytes\n' % (stats, os.path.getsize(dest)))
 
@@ -532,8 +565,6 @@ def resize_image(src):
             os.remove(src)
 
         return [1, 0]
-    except OSError as e:
-        lock_print(e)
 
 
 class ExtendedArgumentParser(argparse.ArgumentParser):

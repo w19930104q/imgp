@@ -1,3 +1,14 @@
+imgp (unreleased)
+
+- Normalize EXIF orientation into pixels before rotating/resampling
+  (fixes wrong output dimensions and double rotation for oriented images)
+- Preserve ICC colour profiles in output images (fixes colour shift)
+- Write output images atomically: no partial files left after a failure
+- Handle truncated/corrupt sources gracefully instead of crashing
+- Add a test suite with an EXIF orientation matrix (tests/)
+
+-------------------------------------------------------------------------------
+
 imgp v3.0
 2026-08-16
 
